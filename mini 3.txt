@@ -1,0 +1,109 @@
+% Load Dataset
+digitDatasetPath = fullfile('C:\Users\psg54\Documents\MATLAB\att_faces');
+imds = imageDatastore(digitDatasetPath, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+
+clear net
+net = vgg19
+inputSize = net.Layers(1).InputSize(1:2);
+
+% Split dataset: 70% train, 30% validation
+[imdsTrain, imdsVal] = splitEachLabel(imds, 0.7, 'randomized');
+
+% Resize images for training
+augTrain = augmentedImageDatastore(inputSize, imdsTrain, 'ColorPreprocessing', 'gray2rgb');
+augVal = augmentedImageDatastore(inputSize, imdsVal, 'ColorPreprocessing', 'gray2rgb');
+
+
+% Modify final layers of AlexNet for fine-tuning
+layersTransfer = net.Layers(1:end-3); % keep all up to fc7
+numClasses = numel(categories(imdsTrain.Labels));
+layers = [
+    layersTransfer
+    fullyConnectedLayer(numClasses,'WeightLearnRateFactor',10,'BiasLearnRateFactor',10)
+    softmaxLayer
+    classificationLayer];
+
+% Training Options
+options = trainingOptions('sgdm', ...
+    'MiniBatchSize', 10, ...
+    'MaxEpochs', 5, ...
+    'InitialLearnRate',1e-4, ...
+    'Shuffle','every-epoch', ...
+    'Verbose',false, ...
+    'Plots','training-progress');
+
+% Train Network
+netTransfer = trainNetwork(augTrain, layers, options);
+
+% Extract fc7 Features for Validation Set
+features = activations(netTransfer, augVal, 'fc7', 'OutputAs', 'rows');
+valLabels = imdsVal.Labels;
+
+% Initialize score sets
+genuineScores = [];
+impostorScores = [];
+
+% Get list of identities
+identities = unique(valLabels);
+
+for i = 1:numel(identities)
+    % Find images for this identity
+    idx = find(valLabels == identities(i));
+    
+    if numel(idx) < 3
+        continue; % skip if not enough validation images
+    end
+
+    % Enrollment: first image
+    enroll = features(idx(1), :);
+    
+    % Verification: second and third image
+    verify = features(idx(2:3), :);
+    
+    % Calculate genuine scores
+    for j = 1:size(verify, 1)
+        score = cosineSimilarity(enroll, verify(j, :));
+        genuineScores(end+1) = score;
+    end
+
+    % Impostor scores: compare enrollment against 1 image of every other identity
+    for k = 1:numel(identities)
+        if k == i
+            continue;
+        end
+        impIdx = find(valLabels == identities(k), 1);
+        if isempty(impIdx)
+            continue;
+        end
+        impFeature = features(impIdx, :);
+        score = cosineSimilarity(enroll, impFeature);
+        impostorScores(end+1) = score;
+    end
+end
+
+% Plot Histogram
+figure;
+histogram(genuineScores, 'Normalization', 'probability');
+hold on;
+histogram(impostorScores, 'Normalization', 'probability');
+legend('Genuine', 'Impostor');
+xlabel('Cosine Similarity');
+ylabel('Probability');
+title('Score Distributions');
+
+% ROC Curve
+scores = [genuineScores, impostorScores];
+labels = [ones(1,length(genuineScores)), zeros(1,length(impostorScores))];
+[fpRate, tpRate, ~, AUC] = perfcurve(labels, scores, 1);
+
+figure;
+plot(fpRate, tpRate, 'LineWidth', 2);
+xlabel('False Positive Rate');
+ylabel('True Positive Rate');
+title(['ROC Curve (AUC = ' num2str(AUC, '%.2f') ')']);
+grid on;
+
+% Cosine Similarity Function
+function sim = cosineSimilarity(a, b)
+    sim = dot(a, b) / (norm(a) * norm(b));
+end
